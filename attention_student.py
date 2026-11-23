@@ -80,6 +80,11 @@ class CustomStridedAttention(nn.Module):
 
         # TODO: Replace the call to the naive implementation below with a call
         # to your custom CUDA kernel `strided_attention_forward`.
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        output = strided_attention_forward(q, k, v, self.stride)
  
         # Using the naive implementation as a placeholder.
         output = naive_strided_attention(q, k, v, self.stride)

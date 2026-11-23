@@ -1,0 +1,105 @@
+# Report
+
+Requirement: *Explain your design of the `strided_attention_forward_kernel` in a short paragraph. For each major design choice, cite where in the code you made this improvement. Explain why your choices help to improve the performance over the `naive_strided_attention`.*
+
+Please use **markdown** previewer to have better reading experience.
+
+## Summary
+
+My kernel achieves 4.62x speedup on `benchmark` mode.
+
+## Part 1: cache q in shared memory
+
+```cpp
+__shared__ T q[256];
+for (int i = idx; i < head_dim; i += blockDim.x) {
+    q[i] = q_ptr[q_offset + i];
+}
+```
+
+No thread will modify this q after loading. So, caching q in shared memory is safe. And accessing it is much faster than reading from HBM.
+
+## Part 2: matrix multiplication
+
+My code does 2 optimization in this part:
+
+1. Cares only about needed values (version 1). Computation and memory access reduce from 1 to $\frac{1}{stride}$. This optimization reduces time from **29.0946 ms** to **15.9141 ms** (1.83x).
+2. Warp optimization (version 2): in version 1, each thread will compute $\sum_kQ_{ik}*K_{kj}$. And because `head_dim` is smaller than `blockDim.x`, some threads are busy while other threads are idle. With this warp optimization, no thread will be idle. Thanks to the high speed communication in warp `__shfl_down_sync`, it has higher thread utilization with little overhead. This optimization reduces time from **28.7098 ms** to **6.2102 ms** (4.62x).
+
+```cpp
+// 1. cares only about needed values
+const int strided_seq_len = (seq_len + stride - 1) / stride;
+
+// scores (strided)
+for (int i = idx; i < strided_seq_len; i += blockDim.x) {
+    T sum = static_cast<T>(0.0);
+    long k_offset = bh_offset + (long)i * stride * head_dim;
+    for (int j = 0; j < head_dim; ++j) {
+        sum += q[j] * k_ptr[k_offset + j];
+    }
+    scores[i] = sum * scale;
+}
+```
+
+```cpp
+// 2. warp optimization
+const int strided_seq_len = (seq_len + stride - 1) / stride;
+
+// scores (strided) + warp
+for (int i = warp_id; i < strided_seq_len; i += num_warps) {
+    T sum = static_cast<T>(0.0);
+    long k_offset = bh_offset + (long)i * stride * head_dim;
+
+    for (int j = lane_id; j < head_dim; j += warpSize) {
+        sum += q[j] * k_ptr[k_offset + j];
+    }
+
+    sum = warp_sum(sum);
+    if (lane_id == 0) {
+        scores[i] = sum * scale;
+    }
+}
+```
+
+## Part 3: optimizations on other reduce process
+
+I applied same optimizations (1. cares only about needed values + 2. warp) on `max_scores`, `exps`, `sums`, and `weights`.
+
+Moreover, some operations are fused: it doesn't calculate `shifted` (= `scores` - `max_scores`), but instead, it calculates `exps` (= exp(`scores` - `max_scores`)) directly.
+
+## Part 4: not apply warp on last matrix multiplication
+
+When calculating output, although this matrix looks similar to [Part 1](#part-1-cache-q-in-shared-memory), they are actually very different. Part 1 is $QK^T$, where threads in a warp are accessing contiguous address in K (e.g. $K_{i0}$ to $K_{i31}$). However, in this part, threads in a warp is accessing non contiguous addresses in V (e.g. $V_{0i}$ to $V_{31i}$).
+
+Compared to naive version, it reduces time from **28.2511 ms** to **19.4704 ms** (1.45x). But compared to naive version (measured in part 1), it is slower ($19.4704 / 6.2102 = 0.32$ x). So, it is better to use a naive version.
+
+```cpp
+// naive version is faster
+for (int i = idx; i < head_dim; i += blockDim.x) {
+    T output = static_cast<T>(0.0);
+    for (int j = 0; j < strided_seq_len; ++j) {
+        long v_offset = bh_offset + (long)j * stride * head_dim;
+        output += scores[j] * v_ptr[v_offset + i];
+    }
+    output_ptr[output_offset + i] = output;
+}
+```
+
+```cpp
+// warp version is even slower
+for (int d = warp_id; d < head_dim; d += num_warps) {
+    T sum = 0.0;
+    for (int j = lane_id; j < strided_seq_len; j += warpSize) {
+        long v_offset = bh_offset + (long)j * stride * head_dim;
+        sum += scores[j] * v_ptr[v_offset + d];
+    }
+    sum = warp_sum(sum);
+    if (lane_id == 0) {
+        output_ptr[output_offset + d] = sum;
+    }
+}
+```
+
+## Warp up
+
+My kernel achieves 4.62x speedup, from **28.7098 ms** to **6.2102 ms**.
