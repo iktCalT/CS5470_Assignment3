@@ -87,7 +87,7 @@ class CustomStridedAttention(nn.Module):
         output = strided_attention_forward(q, k, v, self.stride)
  
         # Using the naive implementation as a placeholder.
-        output = naive_strided_attention(q, k, v, self.stride)
+        # output = naive_strided_attention(q, k, v, self.stride)
 
         # Reshape and project the output back to the original shape
         output = output.permute(0, 2, 1, 3).contiguous()
